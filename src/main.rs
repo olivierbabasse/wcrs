@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Read};
+use memchr::memchr_iter;
 
 fn main() -> io::Result<()> {
     let filename = env::args().nth(1).expect("Usage: wcrs <filename>");
@@ -19,10 +20,8 @@ fn main() -> io::Result<()> {
         }
         let chunk = &buf[..n];
         bytes += n as u64;
+        lines += memchr_iter(b'\n', chunk).count() as u64;
         for &b in chunk {
-            if b == b'\n' {
-                lines += 1;
-            }
             if b.is_ascii_whitespace() {
                 in_word = false;
             } else if !in_word {

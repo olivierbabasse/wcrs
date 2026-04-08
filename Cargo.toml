@@ -12,3 +12,4 @@ debug = true
 strip = false
 
 [dependencies]
+memchr = "2"
