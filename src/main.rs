@@ -1,15 +1,15 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Read};
-use memchr::memchr_iter;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn count_words_avx2(chunk: &[u8], in_word: &mut bool) -> u64 { unsafe {
+unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) { unsafe {
     let mut words: u64 = 0;
+    let mut lines: u64 = 0;
     let mut prev_ws_bit: u32 = if *in_word { 0 } else { 1 };
 
     let space = _mm256_set1_epi8(b' ' as i8);
@@ -25,6 +25,10 @@ unsafe fn count_words_avx2(chunk: &[u8], in_word: &mut bool) -> u64 { unsafe {
     while i + 32 <= len {
         let data = _mm256_loadu_si256(chunk.as_ptr().add(i) as *const __m256i);
 
+        let nl_cmp = _mm256_cmpeq_epi8(data, newline);
+        let nl_mask = _mm256_movemask_epi8(nl_cmp) as u32;
+        lines += nl_mask.count_ones() as u64;
+
         let ws = _mm256_or_si256(
             _mm256_or_si256(
                 _mm256_or_si256(
@@ -32,7 +36,7 @@ unsafe fn count_words_avx2(chunk: &[u8], in_word: &mut bool) -> u64 { unsafe {
                     _mm256_cmpeq_epi8(data, tab),
                 ),
                 _mm256_or_si256(
-                    _mm256_cmpeq_epi8(data, newline),
+                    nl_cmp,
                     _mm256_cmpeq_epi8(data, cr),
                 ),
             ),
@@ -53,13 +57,18 @@ unsafe fn count_words_avx2(chunk: &[u8], in_word: &mut bool) -> u64 { unsafe {
     }
 
     *in_word = prev_ws_bit == 0;
-    words + count_words_scalar(&chunk[i..], in_word)
+    let (tw, tl) = count_scalar(&chunk[i..], in_word);
+    (words + tw, lines + tl)
 }}
 
-fn count_words_scalar(chunk: &[u8], in_word: &mut bool) -> u64 {
+fn count_scalar(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
     let mut words: u64 = 0;
+    let mut lines: u64 = 0;
     let mut iw = *in_word;
     for &b in chunk {
+        if b == b'\n' {
+            lines += 1;
+        }
         if b.is_ascii_whitespace() {
             iw = false;
         } else if !iw {
@@ -68,17 +77,17 @@ fn count_words_scalar(chunk: &[u8], in_word: &mut bool) -> u64 {
         }
     }
     *in_word = iw;
-    words
+    (words, lines)
 }
 
-fn count_words(chunk: &[u8], in_word: &mut bool) -> u64 {
+fn count(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            return unsafe { count_words_avx2(chunk, in_word) };
+            return unsafe { count_avx2(chunk, in_word) };
         }
     }
-    count_words_scalar(chunk, in_word)
+    count_scalar(chunk, in_word)
 }
 
 fn main() -> io::Result<()> {
@@ -98,8 +107,9 @@ fn main() -> io::Result<()> {
         }
         let chunk = &buf[..n];
         bytes += n as u64;
-        lines += memchr_iter(b'\n', chunk).count() as u64;
-        words += count_words(chunk, &mut in_word);
+        let (w, l) = count(chunk, &mut in_word);
+        words += w;
+        lines += l;
     }
 
     println!("  {lines}  {words} {bytes} {filename}");

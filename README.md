@@ -8,3 +8,4 @@ naive implementation, native instruction set : 3.002s
 buffered read and single pass : 2.347s
 line counting with memchr : 2.015s
 SIMD word counting : 0.273s
+SIMD combined word & newline counting : 0.260s
