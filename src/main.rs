@@ -48,6 +48,11 @@ unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
         let mut i = 0;
         let len = chunk.len();
 
+        // Software prefetch lookahead. Tuned by sweep — see the article.
+        // _mm_prefetch is a hint and never faults, so it's safe to prefetch past
+        // the end of the mmap region.
+        const PREFETCH_DIST: usize = 768;
+
         // Hot loop : process full 8160-byte (255 × 32) batches, accumulating
         // counts in per-byte u8 lanes. Flush via _mm256_sad_epu8 to u64 totals
         // before the lanes can overflow.
@@ -56,6 +61,8 @@ unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
             let mut ws_acc = zero;
             let batch_end = i + BATCH_BYTES;
             while i < batch_end {
+                _mm_prefetch::<_MM_HINT_T0>(chunk.as_ptr().add(i + PREFETCH_DIST) as *const i8);
+
                 let data = _mm256_loadu_si256(chunk.as_ptr().add(i) as *const __m256i);
 
                 // Newline counting : cmpeq → -1 per match → subtract from accumulator (= +1).
