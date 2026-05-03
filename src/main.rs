@@ -20,14 +20,20 @@ unsafe fn sum_u64_lanes(v: __m256i) -> u64 {
 #[target_feature(enable = "avx2")]
 unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
     unsafe {
-        // Number of inner iterations per line accumulator flush. Each per-byte u8
-        // lane accumulates at most BATCH +1s before overflow, so we pick BATCH = 255.
+        // Number of inner iterations per accumulator flush. Each per-byte u8 lane
+        // accumulates at most BATCH +1s before overflow, so we pick BATCH = 255.
         const BATCH: usize = 255;
         const BATCH_BYTES: usize = BATCH * 32;
 
         let mut words: u64 = 0;
         let mut lines: u64 = 0;
-        let mut prev_ws_bit: u32 = if *in_word { 0 } else { 1 };
+
+        // prev_ws holds the previous 32-byte block's "is_ws" mask. Only byte 31
+        // (the last byte of the block) is meaningful for cross-iter carry — it
+        // bridges into byte 0 of the next iter via _mm256_alignr_epi8.
+        // Initial value : if we're entering "in a word", the byte before the chunk
+        // was non-whitespace → 0x00. Otherwise → 0xFF.
+        let mut prev_ws: __m256i = _mm256_set1_epi8(if *in_word { 0 } else { -1i8 });
 
         let newline = _mm256_set1_epi8(b'\n' as i8);
         // Single-shuffle whitespace classifier table : each whitespace byte sits at
@@ -42,35 +48,42 @@ unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
         let mut i = 0;
         let len = chunk.len();
 
-        // Lines now use a per-byte vector accumulator flushed via _mm256_sad_epu8
-        // every 255 iterations. Words still use movemask + popcnt.
+        // Hot loop : process full 8160-byte (255 × 32) batches, accumulating
+        // counts in per-byte u8 lanes. Flush via _mm256_sad_epu8 to u64 totals
+        // before the lanes can overflow.
         while i + BATCH_BYTES <= len {
             let mut nl_acc = zero;
+            let mut ws_acc = zero;
             let batch_end = i + BATCH_BYTES;
             while i < batch_end {
                 let data = _mm256_loadu_si256(chunk.as_ptr().add(i) as *const __m256i);
 
-                // Lines : cmpeq → -1 per match → subtract from accumulator (= +1).
+                // Newline counting : cmpeq → -1 per match → subtract from accumulator (= +1).
                 let nl_cmp = _mm256_cmpeq_epi8(data, newline);
                 nl_acc = _mm256_sub_epi8(nl_acc, nl_cmp);
 
-                // Words : single-shuffle classifier + scalar bit manipulation.
+                // Whitespace : single-shuffle classifier.
                 let ws_lookup = _mm256_shuffle_epi8(ws_table, data);
                 let is_ws = _mm256_cmpeq_epi8(ws_lookup, data);
-                let ws_mask = _mm256_movemask_epi8(is_ws) as u32;
 
-                let prev_was_ws = (ws_mask << 1) | prev_ws_bit;
-                let word_starts = !ws_mask & prev_was_ws;
-                words += word_starts.count_ones() as u64;
-                prev_ws_bit = (ws_mask >> 31) & 1;
+                // Word-start detection in vector space : shift is_ws left by 1 byte
+                // (with byte 31 of prev iter feeding in), then AND with !is_ws.
+                // _mm256_alignr_epi8 is intra-lane only, so we permute lanes first.
+                let bridge = _mm256_permute2x128_si256::<0x21>(prev_ws, is_ws);
+                let prev_was_ws_vec = _mm256_alignr_epi8::<15>(is_ws, bridge);
+                let word_starts = _mm256_andnot_si256(is_ws, prev_was_ws_vec);
+                ws_acc = _mm256_sub_epi8(ws_acc, word_starts);
 
+                prev_ws = is_ws;
                 i += 32;
             }
             lines += sum_u64_lanes(_mm256_sad_epu8(nl_acc, zero));
+            words += sum_u64_lanes(_mm256_sad_epu8(ws_acc, zero));
         }
 
-        // Tail SIMD loop (<BATCH iters left, fresh nl accumulator).
+        // Tail SIMD loop : <BATCH 32-byte iters left, accumulators fresh.
         let mut nl_acc = zero;
+        let mut ws_acc = zero;
         while i + 32 <= len {
             let data = _mm256_loadu_si256(chunk.as_ptr().add(i) as *const __m256i);
 
@@ -79,18 +92,25 @@ unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
 
             let ws_lookup = _mm256_shuffle_epi8(ws_table, data);
             let is_ws = _mm256_cmpeq_epi8(ws_lookup, data);
-            let ws_mask = _mm256_movemask_epi8(is_ws) as u32;
 
-            let prev_was_ws = (ws_mask << 1) | prev_ws_bit;
-            let word_starts = !ws_mask & prev_was_ws;
-            words += word_starts.count_ones() as u64;
-            prev_ws_bit = (ws_mask >> 31) & 1;
+            let bridge = _mm256_permute2x128_si256::<0x21>(prev_ws, is_ws);
+            let prev_was_ws_vec = _mm256_alignr_epi8::<15>(is_ws, bridge);
+            let word_starts = _mm256_andnot_si256(is_ws, prev_was_ws_vec);
+            ws_acc = _mm256_sub_epi8(ws_acc, word_starts);
 
+            prev_ws = is_ws;
             i += 32;
         }
         lines += sum_u64_lanes(_mm256_sad_epu8(nl_acc, zero));
+        words += sum_u64_lanes(_mm256_sad_epu8(ws_acc, zero));
 
-        *in_word = prev_ws_bit == 0;
+        // Recover in_word state from byte 31 of prev_ws (last SIMD byte's WS status).
+        // 0xFF means the byte was whitespace, so we end NOT in a word.
+        let mut tmp = [0u8; 32];
+        _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, prev_ws);
+        *in_word = tmp[31] == 0;
+
+        // Remaining <32 bytes go through the scalar path.
         let (tw, tl) = count_scalar(&chunk[i..], in_word);
         (words + tw, lines + tl)
     }

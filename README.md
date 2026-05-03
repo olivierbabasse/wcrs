@@ -12,3 +12,4 @@ mmap instead of buffered reading : 137ms
 shuffle-based whitespace classifier : 135ms
 single shuffle classifier : 124ms
 "sum of absolute differences" instead of popcount trick : 120ms
+SAD trick also on word path : 116ms
