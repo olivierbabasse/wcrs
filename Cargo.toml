@@ -13,3 +13,4 @@ strip = false
 
 [dependencies]
 memmap2 = "0.9"
+rayon = "1"

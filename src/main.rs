@@ -1,4 +1,5 @@
 use memmap2::Mmap;
+use rayon::prelude::*;
 use std::env;
 use std::fs::File;
 use std::io::{self};
@@ -152,15 +153,58 @@ fn count(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
     count_scalar(chunk, in_word)
 }
 
+struct ChunkResult {
+    words: u64,
+    lines: u64,
+    starts_nonws: bool,
+    ends_nonws: bool,
+}
+
+fn count_chunk(chunk: &[u8]) -> ChunkResult {
+    if chunk.is_empty() {
+        return ChunkResult { words: 0, lines: 0, starts_nonws: false, ends_nonws: false };
+    }
+    // Each chunk is processed independently with in_word = false. The cross-chunk
+    // word-boundary fix-up happens during merge.
+    let mut in_word = false;
+    let (words, lines) = count(chunk, &mut in_word);
+    ChunkResult {
+        words,
+        lines,
+        starts_nonws: !chunk[0].is_ascii_whitespace(),
+        ends_nonws: !chunk[chunk.len() - 1].is_ascii_whitespace(),
+    }
+}
+
 fn main() -> io::Result<()> {
     let filename = env::args().nth(1).expect("Usage: wcrs <filename>");
     let file = File::open(&filename)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let data: &[u8] = &mmap;
     let bytes = data.len() as u64;
-    let mut in_word = false;
 
-    let (words, lines) = count(data, &mut in_word);
+    // Split into one chunk per thread for rayon to parallelise.
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk_size = data.len().div_ceil(n_threads).max(1);
+
+    let results: Vec<ChunkResult> = data
+        .par_chunks(chunk_size)
+        .map(count_chunk)
+        .collect();
+
+    let mut lines: u64 = 0;
+    let mut words: u64 = 0;
+    for r in &results {
+        lines += r.lines;
+        words += r.words;
+    }
+    // Cross-chunk fix-up : if chunk N ends in non-whitespace and chunk N+1 starts in
+    // non-whitespace, the word straddling the boundary was counted twice.
+    for i in 1..results.len() {
+        if results[i - 1].ends_nonws && results[i].starts_nonws {
+            words -= 1;
+        }
+    }
 
     println!("  {lines}  {words} {bytes} {filename}");
     Ok(())
