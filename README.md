@@ -9,3 +9,4 @@ line counting with memchr : 1.627s
 SIMD word counting : 157ms
 SIMD combined word & newline counting : 154ms
 mmap instead of buffered reading : 137ms
+shuffle-based whitespace classifier : 135ms

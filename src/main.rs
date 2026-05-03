@@ -14,12 +14,27 @@ unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
         let mut lines: u64 = 0;
         let mut prev_ws_bit: u32 = if *in_word { 0 } else { 1 };
 
-        let space = _mm256_set1_epi8(b' ' as i8);
-        let tab = _mm256_set1_epi8(b'\t' as i8);
         let newline = _mm256_set1_epi8(b'\n' as i8);
-        let cr = _mm256_set1_epi8(b'\r' as i8);
-        let vt = _mm256_set1_epi8(0x0B as i8);
-        let ff = _mm256_set1_epi8(0x0C as i8);
+
+        // Two-shuffle nibble classifier for ASCII whitespace.
+        // Whitespace bytes : 0x09 0x0A 0x0B 0x0C 0x0D 0x20.
+        // Each gets a unique bit ; lo_table[low_nibble] AND hi_table[high_nibble]
+        // is non-zero iff the byte is whitespace.
+        // Tables are duplicated across both 128-bit lanes for vpshufb.
+        let lo_table = _mm256_setr_epi8(
+            0x20, 0,    0,    0,    0,    0,    0,    0,
+            0,    0x01, 0x02, 0x04, 0x08, 0x10, 0,    0,
+            0x20, 0,    0,    0,    0,    0,    0,    0,
+            0,    0x01, 0x02, 0x04, 0x08, 0x10, 0,    0,
+        );
+        let hi_table = _mm256_setr_epi8(
+            0x1F, 0,    0x20, 0,    0,    0,    0,    0,
+            0,    0,    0,    0,    0,    0,    0,    0,
+            0x1F, 0,    0x20, 0,    0,    0,    0,    0,
+            0,    0,    0,    0,    0,    0,    0,    0,
+        );
+        let nibble_mask = _mm256_set1_epi8(0x0F);
+        let zero = _mm256_setzero_si256();
 
         let mut i = 0;
         let len = chunk.len();
@@ -27,22 +42,22 @@ unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
         while i + 32 <= len {
             let data = _mm256_loadu_si256(chunk.as_ptr().add(i) as *const __m256i);
 
+            // Lines : direct cmpeq with '\n'.
             let nl_cmp = _mm256_cmpeq_epi8(data, newline);
             let nl_mask = _mm256_movemask_epi8(nl_cmp) as u32;
             lines += nl_mask.count_ones() as u64;
 
-            let ws = _mm256_or_si256(
-                _mm256_or_si256(
-                    _mm256_or_si256(_mm256_cmpeq_epi8(data, space), _mm256_cmpeq_epi8(data, tab)),
-                    _mm256_or_si256(nl_cmp, _mm256_cmpeq_epi8(data, cr)),
-                ),
-                _mm256_or_si256(_mm256_cmpeq_epi8(data, vt), _mm256_cmpeq_epi8(data, ff)),
-            );
+            // Whitespace : two-shuffle nibble classifier.
+            let lo_nib = _mm256_and_si256(data, nibble_mask);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(data, 4), nibble_mask);
+            let lo_match = _mm256_shuffle_epi8(lo_table, lo_nib);
+            let hi_match = _mm256_shuffle_epi8(hi_table, hi_nib);
+            let intersect = _mm256_and_si256(lo_match, hi_match);
+            let is_not_ws = _mm256_cmpeq_epi8(intersect, zero);
+            let ws_mask = !(_mm256_movemask_epi8(is_not_ws) as u32);
 
-            let ws_mask = _mm256_movemask_epi8(ws) as u32;
-            let not_ws_mask = !ws_mask;
             let prev_was_ws = (ws_mask << 1) | prev_ws_bit;
-            let word_starts = not_ws_mask & prev_was_ws;
+            let word_starts = !ws_mask & prev_was_ws;
             words += word_starts.count_ones() as u64;
             prev_ws_bit = (ws_mask >> 31) & 1;
 
