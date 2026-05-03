@@ -14,3 +14,5 @@ single shuffle classifier : 124ms
 "sum of absolute differences" instead of popcount trick : 120ms
 SAD trick also on word path : 116ms
 software prefetching : 104ms
+parallel with rayon : 57ms
+enabling THP : 37ms

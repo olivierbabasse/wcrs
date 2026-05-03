@@ -162,7 +162,12 @@ struct ChunkResult {
 
 fn count_chunk(chunk: &[u8]) -> ChunkResult {
     if chunk.is_empty() {
-        return ChunkResult { words: 0, lines: 0, starts_nonws: false, ends_nonws: false };
+        return ChunkResult {
+            words: 0,
+            lines: 0,
+            starts_nonws: false,
+            ends_nonws: false,
+        };
     }
     // Each chunk is processed independently with in_word = false. The cross-chunk
     // word-boundary fix-up happens during merge.
@@ -180,6 +185,7 @@ fn main() -> io::Result<()> {
     let filename = env::args().nth(1).expect("Usage: wcrs <filename>");
     let file = File::open(&filename)?;
     let mmap = unsafe { Mmap::map(&file)? };
+    let _ = mmap.advise(memmap2::Advice::HugePage);
     let data: &[u8] = &mmap;
     let bytes = data.len() as u64;
 
@@ -187,10 +193,7 @@ fn main() -> io::Result<()> {
     let n_threads = rayon::current_num_threads().max(1);
     let chunk_size = data.len().div_ceil(n_threads).max(1);
 
-    let results: Vec<ChunkResult> = data
-        .par_chunks(chunk_size)
-        .map(count_chunk)
-        .collect();
+    let results: Vec<ChunkResult> = data.par_chunks(chunk_size).map(count_chunk).collect();
 
     let mut lines: u64 = 0;
     let mut words: u64 = 0;
