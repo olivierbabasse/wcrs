@@ -12,3 +12,4 @@ debug = true
 strip = false
 
 [dependencies]
+memmap2 = "0.9"

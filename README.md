@@ -1,11 +1,11 @@
 starting idea : https://codingchallenges.fyi/challenges/challenge-wc/
 
-hyperfine tests on MacBookPro i5 early 2015, 1GB file :
-reference implementation /usr/bin/wc : 3.645s
-naive implementation, default release options : 3.233s
-naive implementation, codegen-units, lto, panic, target native, debug info : no significant change
-naive implementation, native instruction set : 3.002s
-buffered read and single pass : 2.347s
-line counting with memchr : 2.015s
-SIMD word counting : 0.273s
-SIMD combined word & newline counting : 0.260s
+hyperfine tests on i7-9700, linux kernel 6.8.0, 1GB file :
+reference implementation /usr/bin/wc : 3.830s
+naive implementation, default release options : 2.372s
+naive implementation, native instruction set : 2.055s
+buffered read and single pass : 1.822s
+line counting with memchr : 1.627s
+SIMD word counting : 157ms
+SIMD combined word & newline counting : 154ms
+mmap instead of buffered reading : 137ms

@@ -17,18 +17,18 @@ $(TESTFILE): test.txt
 testfile: $(TESTFILE)
 
 bench: build $(TESTFILE)
-	hyperfine --warmup 3 --runs 10 '$(BINARY) $(TESTFILE)'
+	LC_ALL=C hyperfine --warmup 3 --runs 10 '$(BINARY) $(TESTFILE)'
 
 allbench: build $(TESTFILE)
-	hyperfine --warmup 3 --runs 10 'wc $(TESTFILE)' '$(BINARY) $(TESTFILE)'
+	LC_ALL=C hyperfine --warmup 3 --runs 10 'wc $(TESTFILE)' '$(BINARY) $(TESTFILE)'
 
 systembench: $(TESTFILE)
-	hyperfine --warmup 3 --runs 10 'wc $(TESTFILE)'
+	LC_ALL=C hyperfine --warmup 3 --runs 10 'wc $(TESTFILE)'
 
 check: build $(TESTFILE)
-	@echo "wc:   $$(wc test.txt)"
+	@echo "wc:   $$(LC_ALL=C wc test.txt)"
 	@echo "wcrs: $$($(BINARY) test.txt)"
-	@echo "wc:   $$(wc $(TESTFILE))"
+	@echo "wc:   $$(LC_ALL=C wc $(TESTFILE))"
 	@echo "wcrs: $$($(BINARY) $(TESTFILE))"
 
 clean:
