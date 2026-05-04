@@ -1,8 +1,9 @@
-use memmap2::Mmap;
+use memmap2::{Advice, MmapMut, MmapOptions};
 use rayon::prelude::*;
 use std::env;
 use std::fs::File;
 use std::io::{self};
+use std::os::unix::fs::FileExt;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -49,7 +50,7 @@ unsafe fn count_avx2(chunk: &[u8], in_word: &mut bool) -> (u64, u64) {
         let mut i = 0;
         let len = chunk.len();
 
-        // Software prefetch lookahead. Tuned by sweep — see the article.
+        // Software prefetch lookahead.
         // _mm_prefetch is a hint and never faults, so it's safe to prefetch past
         // the end of the mmap region.
         const PREFETCH_DIST: usize = 768;
@@ -160,8 +161,34 @@ struct ChunkResult {
     ends_nonws: bool,
 }
 
-fn count_chunk(chunk: &[u8]) -> ChunkResult {
-    if chunk.is_empty() {
+// Per-thread pread buffer size. 128 KB matches fastlwc — fits in L2 with margin
+// for code/state, big enough that pread overhead amortises, small enough that
+// the SIMD scan keeps its working set in cache.
+const PREAD_BUFSIZE: usize = 128 * 1024;
+// Anonymous huge-page allocation. Must be at least 2 MB and 2 MB-aligned for the
+// kernel to back it with a single huge page (with MADV_HUGEPAGE in effect).
+// We use only PREAD_BUFSIZE of it ; the rest sits unused but huge-page-mapped.
+const HUGE_BUF_SIZE: usize = 2 * 1024 * 1024;
+
+// Allocate a big huge-page-backed buffer covering n_threads * HUGE_BUF_SIZE.
+// One mmap call instead of N parallel ones.
+fn alloc_big_huge_buf(n_threads: usize) -> MmapMut {
+    let total = n_threads * HUGE_BUF_SIZE;
+    let mut m = MmapOptions::new().len(total).map_anon().expect("map_anon");
+    let _ = m.advise(Advice::HugePage);
+    // Touch one byte per huge-page slot so each gets faulted-in as a huge page
+    // up-front (synchronously here, before any worker thread starts scanning).
+    // MmapMut derefs to [u8], so this is bounds-checked indexing.
+    let mut o = 0;
+    while o < total {
+        m[o] = 0;
+        o += HUGE_BUF_SIZE;
+    }
+    m
+}
+
+fn count_range(file: &File, start: u64, end: u64, buf: &mut [u8]) -> ChunkResult {
+    if start >= end {
         return ChunkResult {
             words: 0,
             lines: 0,
@@ -169,31 +196,67 @@ fn count_chunk(chunk: &[u8]) -> ChunkResult {
             ends_nonws: false,
         };
     }
-    // Each chunk is processed independently with in_word = false. The cross-chunk
-    // word-boundary fix-up happens during merge.
+    let mut total_words: u64 = 0;
+    let mut total_lines: u64 = 0;
+    // count() carries word-boundary state across calls via &mut bool — we just
+    // thread it through every pread chunk in this thread's range.
     let mut in_word = false;
-    let (words, lines) = count(chunk, &mut in_word);
+
+    let mut first_byte: Option<u8> = None;
+    let mut last_byte: u8 = 0;
+
+    let mut offset = start;
+    while offset < end {
+        let to_read = ((end - offset) as usize).min(PREAD_BUFSIZE).min(buf.len());
+        let n = file.read_at(&mut buf[..to_read], offset).expect("read_at");
+        if n == 0 {
+            panic!("unexpected EOF at offset {offset}");
+        }
+        let slice = &buf[..n];
+        if first_byte.is_none() {
+            first_byte = Some(slice[0]);
+        }
+        last_byte = slice[n - 1];
+        let (w, l) = count(slice, &mut in_word);
+        total_words += w;
+        total_lines += l;
+        offset += n as u64;
+    }
+
     ChunkResult {
-        words,
-        lines,
-        starts_nonws: !chunk[0].is_ascii_whitespace(),
-        ends_nonws: !chunk[chunk.len() - 1].is_ascii_whitespace(),
+        words: total_words,
+        lines: total_lines,
+        starts_nonws: !first_byte.unwrap().is_ascii_whitespace(),
+        ends_nonws: !last_byte.is_ascii_whitespace(),
     }
 }
 
 fn main() -> io::Result<()> {
     let filename = env::args().nth(1).expect("Usage: wcrs <filename>");
     let file = File::open(&filename)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let _ = mmap.advise(memmap2::Advice::HugePage);
-    let data: &[u8] = &mmap;
-    let bytes = data.len() as u64;
+    let bytes = file.metadata()?.len();
 
-    // Split into one chunk per thread for rayon to parallelise.
+    // Split the file into one contiguous byte-range per worker thread.
     let n_threads = rayon::current_num_threads().max(1);
-    let chunk_size = data.len().div_ceil(n_threads).max(1);
+    let chunk_size = (bytes as usize).div_ceil(n_threads).max(1);
+    let ranges: Vec<(u64, u64)> = (0..n_threads)
+        .map(|i| {
+            let s = (i * chunk_size) as u64;
+            let e = ((i + 1) * chunk_size).min(bytes as usize) as u64;
+            (s, e)
+        })
+        .filter(|(s, e)| s < e)
+        .collect();
 
-    let results: Vec<ChunkResult> = data.par_chunks(chunk_size).map(count_chunk).collect();
+    // Allocate one big huge-page-backed buffer up-front and hand each worker
+    // its own non-overlapping slice via par_chunks_mut
+    let mut big_buf = alloc_big_huge_buf(ranges.len());
+
+    let results: Vec<ChunkResult> = big_buf
+        .par_chunks_mut(HUGE_BUF_SIZE)
+        .zip(ranges.par_iter())
+        .map(|(buf, &(s, e))| count_range(&file, s, e, buf))
+        .collect();
 
     let mut lines: u64 = 0;
     let mut words: u64 = 0;
@@ -201,8 +264,8 @@ fn main() -> io::Result<()> {
         lines += r.lines;
         words += r.words;
     }
-    // Cross-chunk fix-up : if chunk N ends in non-whitespace and chunk N+1 starts in
-    // non-whitespace, the word straddling the boundary was counted twice.
+    // Cross-thread fix-up : if range N ends in non-whitespace and range N+1 starts
+    // in non-whitespace, the word straddling the boundary was counted twice.
     for i in 1..results.len() {
         if results[i - 1].ends_nonws && results[i].starts_nonws {
             words -= 1;

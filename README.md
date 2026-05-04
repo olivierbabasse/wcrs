@@ -16,3 +16,4 @@ SAD trick also on word path : 116ms
 software prefetching : 104ms
 parallel with rayon : 57ms
 enabling THP : 37ms
+using pread instead of mmap : 40ms
